@@ -2,7 +2,7 @@
 
 > Hybrid retrieval (BM25 + dense) with cross-encoder reranking, query rewriting, and a real evaluation harness over ~500 ArXiv ML papers.
 
-**Status:** 🚧 Week 1 / 3 — ingestion in progress
+**Status:**  Week 1 / 3 — ingestion in progress
 
 ---
 
