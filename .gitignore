@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.python-version
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+.uv/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Project data — never commit these
+data/pdfs/
+data/lancedb/
+data/*.jsonl
+!data/.gitkeep
+
+# Eval runs
+evals/runs/
+!evals/.gitkeep
+
+# Secrets
+.env
+.env.local
+*.key
+
+# Logs
+*.log
+logs/
+
+# Model caches
+.cache/
+models/
