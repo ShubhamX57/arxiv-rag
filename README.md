@@ -28,12 +28,12 @@ Most RAG demos are single-script notebooks that retrieve top-k and stuff into a 
 
 ```
 ┌──────────────┐    ┌──────────┐    ┌────────────┐    ┌──────────┐
-│ ArXiv API    │───▶│ Parse +  │───▶│ Embed +    │───▶│ LanceDB  │
+│ ArXiv API    │───>│ Parse +  │───>│ Embed +    │───>│ LanceDB  │
 │ (cs.LG/CL)   │    │ Chunk    │    │ BM25 index │    │          │
 └──────────────┘    └──────────┘    └────────────┘    └──────────┘
                                                             │
                 ┌──────────────┐    ┌──────────┐            │
-       Query ──▶│ Query rewrite│───▶│ Hybrid   │◀───────────┘
+       Query ──>│ Query rewrite│───>│ Hybrid   │<───────────┘
                 │ + HyDE       │    │ retrieval│
                 └──────────────┘    └──────────┘
                                           │
@@ -42,11 +42,11 @@ Most RAG demos are single-script notebooks that retrieve top-k and stuff into a 
                                     └──────────┘
                                           │
                                     ┌──────────┐    ┌──────────┐
-                                    │ LLM gen  │───▶│ Answer + │
+                                    │ LLM gen  │───>│ Answer + │
                                     │ + ground │    │ citations│
                                     └──────────┘    └──────────┘
                                           │
-                                          ▼
+                                          
                               Langfuse traces + RAGAS evals
 ```
 
