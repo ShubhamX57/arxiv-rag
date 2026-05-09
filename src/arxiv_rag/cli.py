@@ -84,13 +84,49 @@ def parse(
 
 @app.command()
 def chunk(
-    strategy: str = typer.Option("recursive", "--strategy", "-s"),
+    strategy: str = typer.Option(
+        "recursive",
+        "--strategy",
+        "-s",
+        help="Chunking strategy: fixed | recursive (semantic on Day 5).",
+    ),
+    chunk_size: int = typer.Option(
+        settings.chunk_size, "--chunk-size", help="Target chunk size in tokens."
+    ),
+    chunk_overlap: int = typer.Option(
+        settings.chunk_overlap, "--overlap", help="Token overlap between chunks."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Chunk parsed sections."""
+    """Chunk parsed sections into retrieval units."""
     _setup_logging(verbose)
-    typer.echo(f"Not implemented yet (strategy={strategy}) — Week 1, Day 4.")
-    raise typer.Exit(code=1)
+    settings.ensure_dirs()
+
+    from arxiv_rag.ingest.chunking import ChunkStrategy, chunk_sections
+
+    try:
+        strat = ChunkStrategy(strategy)
+    except ValueError:
+        typer.echo(
+            f"Unknown strategy: {strategy!r}. "
+            f"Choose from: {', '.join(s.value for s in ChunkStrategy)}"
+        )
+        raise typer.Exit(code=1) from None
+
+    stats = chunk_sections(
+        strategy=strat,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+    typer.echo(
+        f"\n✔ Strategy={strat.value}  papers={int(stats['papers'])}  "
+        f"sections={int(stats['sections'])}  chunks={int(stats['total_chunks'])}"
+    )
+    typer.echo(
+        f"  Token length — mean={stats['mean_tokens']}  "
+        f"median={stats['median_tokens']}  p90={stats['p90_tokens']}  "
+        f"p99={stats['p99_tokens']}"
+    )
 
 
 @app.command()
