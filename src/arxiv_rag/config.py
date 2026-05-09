@@ -5,8 +5,8 @@ Never hardcode paths or model names elsewhere — import from here.
 """
 
 from __future__ import annotations
+
 from datetime import date
-from pathlib import Path
 from pathlib import Path
 
 from pydantic import Field
@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=PROJECT_ROOT / "data")
     pdf_dir: Path = Field(default=PROJECT_ROOT / "data" / "pdfs")
     metadata_path: Path = Field(default=PROJECT_ROOT / "data" / "metadata.jsonl")
+    sections_path: Path = Field(default=PROJECT_ROOT / "data" / "sections.jsonl")
     chunks_path: Path = Field(default=PROJECT_ROOT / "data" / "chunks.jsonl")
     lancedb_dir: Path = Field(default=PROJECT_ROOT / "data" / "lancedb")
     evals_dir: Path = Field(default=PROJECT_ROOT / "evals")

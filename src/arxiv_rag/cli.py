@@ -62,11 +62,24 @@ def fetch(
 
 
 @app.command()
-def parse(verbose: bool = typer.Option(False, "--verbose", "-v")) -> None:
+def parse(
+    max_workers: int = typer.Option(
+        None, "--workers", "-w", help="Parallel workers (default: CPU count)."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
     """Parse PDFs in data/pdfs into structured sections."""
     _setup_logging(verbose)
-    typer.echo("Not implemented yet — Week 1, Day 3.")
-    raise typer.Exit(code=1)
+    settings.ensure_dirs()
+
+    from arxiv_rag.ingest.pdf_parse import parse_all
+
+    stats = parse_all(max_workers=max_workers)
+    typer.echo(
+        f"\n✔ Parsed {stats['papers_parsed']} papers "
+        f"({stats['papers_failed']} failed) → "
+        f"{stats['total_sections']} sections at {settings.sections_path}"
+    )
 
 
 @app.command()
