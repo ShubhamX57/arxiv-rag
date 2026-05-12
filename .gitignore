@@ -45,6 +45,8 @@ htmlcov/
 data/pdfs/
 data/lancedb/
 data/*.jsonl
+data/*.pkl
+data/*.parquet
 !data/.gitkeep
 
 # Eval runs

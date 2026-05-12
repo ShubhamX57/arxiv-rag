@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import statistics
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 
 import tiktoken
 from tqdm import tqdm
@@ -61,6 +62,21 @@ class Chunk:
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> Chunk:
+        """Construct a Chunk from a dict loaded from chunks JSONL."""
+        return cls(
+            chunk_id=str(d["chunk_id"]),
+            paper_id=str(d["paper_id"]),
+            section_index=int(d["section_index"]),  # type: ignore[call-overload]
+            section_title=str(d["section_title"]),
+            chunk_index=int(d["chunk_index"]),  # type: ignore[call-overload]
+            text=str(d["text"]),
+            char_count=int(d["char_count"]),  # type: ignore[call-overload]
+            token_count=int(d["token_count"]),  # type: ignore[call-overload]
+            strategy=str(d["strategy"]),
+        )
 
 
 # ---------------- Chunker protocol + implementations ----------------
@@ -224,18 +240,130 @@ class RecursiveChunker:
         return with_overlap
 
 
+class SemanticChunker:
+    """Splits text where consecutive sentence embeddings diverge.
+
+    Algorithm:
+    1. Split text into sentences (regex-based, good enough for prose).
+    2. Embed each sentence.
+    3. Compute cosine similarity between consecutive embeddings.
+    4. Find the Nth percentile *drop* in similarity (default: 95th) — these
+       are the strongest topic boundaries.
+    5. Build chunks by accumulating sentences and breaking at those points,
+       while respecting chunk_size (fallback to recursive splitting if a
+       semantic segment is too large).
+
+    The intuition: paragraph breaks within a section often happen for layout
+    reasons, but topic shifts happen where the *meaning* changes. Embedding
+    similarity captures that.
+
+    Trade-off: slower than recursive (must embed every sentence) and the
+    quality vs recursive in practice is mixed — sometimes wins on long
+    sections, sometimes worse on short ones with no real topic shift. We
+    measure which in Week 2's ablation.
+    """
+
+    # Regex captures sentence boundaries: period/question/exclamation followed
+    # by whitespace + uppercase. Loses on abbreviations ("e.g.", "Mr.") but
+    # that's acceptable noise for chunking purposes.
+    _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+
+    def __init__(
+        self,
+        chunk_size: int,
+        chunk_overlap: int,
+        embedder: object,
+        breakpoint_percentile: float = 95.0,
+    ) -> None:
+        if chunk_overlap >= chunk_size:
+            raise ValueError("chunk_overlap must be strictly less than chunk_size")
+        if not 50.0 <= breakpoint_percentile <= 99.5:
+            raise ValueError("breakpoint_percentile must be between 50 and 99.5")
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.embedder = embedder
+        self.breakpoint_percentile = breakpoint_percentile
+        # Use recursive splitter as fallback when a semantic segment is too big
+        self._recursive_fallback = RecursiveChunker(chunk_size, chunk_overlap)
+        self._encoder = _get_encoder()
+
+    def _split_sentences(self, text: str) -> list[str]:
+        # Pre-split on paragraph breaks first to keep sentences cohesive
+        sentences: list[str] = []
+        for para in text.split("\n\n"):
+            para = para.strip()
+            if not para:
+                continue
+            parts = self._SENT_SPLIT.split(para)
+            sentences.extend(p.strip() for p in parts if p.strip())
+        return sentences
+
+    def chunk(self, text: str) -> list[str]:
+        if not text.strip():
+            return []
+
+        sentences = self._split_sentences(text)
+        # Very short text: don't bother embedding
+        if len(sentences) <= 2 or self._token_len(text) <= self.chunk_size:
+            return [text]
+
+        # Embed sentences silently — this happens per-section in a loop
+        import numpy as np
+
+        vectors = self.embedder.embed(sentences, show_progress_bar=False)  # type: ignore[attr-defined]
+
+        # Cosine similarity between consecutive sentences (vectors are normalized)
+        sims = np.einsum("ij,ij->i", vectors[:-1], vectors[1:])
+        # Lower similarity = bigger topic shift = better break point
+        drops = 1.0 - sims
+        threshold = float(np.percentile(drops, self.breakpoint_percentile))
+
+        # Build segments by grouping sentences between break points
+        segments: list[str] = []
+        current: list[str] = [sentences[0]]
+        for i, drop in enumerate(drops):
+            if drop >= threshold:
+                segments.append(" ".join(current))
+                current = []
+            current.append(sentences[i + 1])
+        if current:
+            segments.append(" ".join(current))
+
+        # Enforce chunk_size: fall back to recursive on oversized segments
+        out: list[str] = []
+        for seg in segments:
+            if self._token_len(seg) <= self.chunk_size:
+                out.append(seg)
+            else:
+                out.extend(self._recursive_fallback.chunk(seg))
+        return out
+
+    def _token_len(self, text: str) -> int:
+        return len(self._encoder.encode(text))
+
+
 def make_chunker(
     strategy: ChunkStrategy,
     chunk_size: int,
     chunk_overlap: int,
+    embedder: object | None = None,
 ) -> Chunker:
-    """Factory: pick a chunker by strategy name."""
+    """Factory: pick a chunker by strategy name.
+
+    Semantic chunking requires an Embedder. The factory accepts it as a generic
+    `object` to avoid a circular import with the retrieval package.
+    """
     if strategy == ChunkStrategy.FIXED:
         return FixedChunker(chunk_size, chunk_overlap)
     if strategy == ChunkStrategy.RECURSIVE:
         return RecursiveChunker(chunk_size, chunk_overlap)
     if strategy == ChunkStrategy.SEMANTIC:
-        raise NotImplementedError("Semantic chunking is wired up on Day 5 alongside the embedder.")
+        if embedder is None:
+            raise ValueError(
+                "SemanticChunker requires an embedder. "
+                "Call chunk_sections(strategy=SEMANTIC) which provides one."
+            )
+        return SemanticChunker(chunk_size, chunk_overlap, embedder)
     raise ValueError(f"Unknown strategy: {strategy}")  # pragma: no cover
 
 
@@ -260,7 +388,13 @@ def chunk_sections(
     if out_path is None:
         out_path = sections_path.parent / f"chunks_{strategy.value}.jsonl"
 
-    chunker = make_chunker(strategy, chunk_size, chunk_overlap)
+    # Lazy: construct embedder only for semantic; avoids heavy imports otherwise
+    if strategy == ChunkStrategy.SEMANTIC:
+        from arxiv_rag.retrieval.embedder import Embedder
+
+        chunker = make_chunker(strategy, chunk_size, chunk_overlap, embedder=Embedder())
+    else:
+        chunker = make_chunker(strategy, chunk_size, chunk_overlap)
     encoder = _get_encoder()  # for token counts in metadata
 
     # Read sections (small enough to fit in memory: ~2k for our corpus)
@@ -288,7 +422,7 @@ def chunk_sections(
     with out_path.open("w") as out_f:
         for section in tqdm(sections, desc=f"Chunking [{strategy.value}]"):
             paper_id = str(section["paper_id"])
-            section_index = int(section["section_index"])  # type: ignore[call-overload]
+            section_index = cast(int, section["section_index"])
             section_title = str(section["section_title"])
             text = str(section["text"])
             paper_ids.add(paper_id)
@@ -346,6 +480,7 @@ __all__ = [
     "Chunker",
     "FixedChunker",
     "RecursiveChunker",
+    "SemanticChunker",
     "chunk_sections",
     "make_chunker",
 ]

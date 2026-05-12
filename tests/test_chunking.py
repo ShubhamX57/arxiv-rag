@@ -162,8 +162,8 @@ def test_make_chunker_recursive() -> None:
     assert isinstance(c, RecursiveChunker)
 
 
-def test_make_chunker_semantic_not_implemented() -> None:
-    with pytest.raises(NotImplementedError):
+def test_make_chunker_semantic_requires_embedder() -> None:
+    with pytest.raises(ValueError, match="embedder"):
         make_chunker(ChunkStrategy.SEMANTIC, 100, 10)
 
 
