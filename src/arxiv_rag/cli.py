@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import typer
 
@@ -224,6 +225,83 @@ def search(
     else:
         typer.echo(f"Unknown mode: {mode}. Use 'dense' or 'sparse'.")
         raise typer.Exit(code=1)
+
+
+@app.command(name="search-hybrid")
+def search_hybrid(
+    query: str = typer.Argument(..., help="Query text."),
+    strategy: str = typer.Option(
+        "recursive", "--strategy", "-s", help="Which strategy's index to query."
+    ),
+    k: int = typer.Option(10, "--k", help="Final top-k after fusion."),
+    fan_out_k: int = typer.Option(
+        50, "--fan-out", help="Candidates fetched from each retriever before fusion."
+    ),
+    rrf_k: int = typer.Option(60, "--rrf-k", help="RRF constant (paper default = 60)."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Hybrid (dense + BM25 via RRF) retrieval. Shows ranks from both retrievers."""
+    _setup_logging(verbose)
+
+    from arxiv_rag.retrieval import HybridRetriever
+
+    retriever = HybridRetriever(strategy=strategy, rrf_k=rrf_k)
+    hits = retriever.search(query, k=k, fan_out_k=fan_out_k)
+
+    for i, h in enumerate(hits, 1):
+        d = f"d{h.dense_rank}" if h.dense_rank else "d—"
+        s = f"s{h.sparse_rank}" if h.sparse_rank else "s—"
+        text = h.text[:200].replace("\n", " ")
+        typer.echo(f"\n[{i}] {h.paper_id} / {h.section_title}  rrf={h.rrf_score:.4f}  ({d} {s})")
+        typer.echo(f"    {text}...")
+        typer.echo(f"    {text}...")
+
+
+@app.command(name="generate-evals")
+def generate_evals(
+    strategy: str = typer.Option(
+        "recursive", "--strategy", "-s", help="Which chunking strategy to draw from."
+    ),
+    n_single: int = typer.Option(200, "--n-single", help="Single-hop questions to generate."),
+    n_no_answer: int = typer.Option(30, "--n-no-answer", help="No-answer questions."),
+    seed: int = typer.Option(42, "--seed", help="Random seed for chunk sampling."),
+    min_confidence: float = typer.Option(
+        0.6, "--min-confidence", help="Filter out items below this confidence."
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Output path (default: evals/eval_set_raw.jsonl)."
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Generate a raw synthetic Q&A eval set. Manual review required after."""
+    _setup_logging(verbose)
+    settings.ensure_dirs()
+
+    from arxiv_rag.evals import generate_eval_set, write_jsonl
+    from arxiv_rag.retrieval import load_chunks_jsonl
+
+    chunks_path = settings.data_dir / f"chunks_{strategy}.jsonl"
+    if not chunks_path.exists():
+        typer.echo(
+            f"No chunks at {chunks_path}. Run `arxiv-rag chunk --strategy {strategy}` first."
+        )
+        raise typer.Exit(code=1)
+
+    out_path = output or (settings.evals_dir / "eval_set_raw.jsonl")
+    chunks = load_chunks_jsonl(chunks_path)
+    typer.echo(f"Loaded {len(chunks)} chunks. Generating eval items...")
+
+    items, stats = generate_eval_set(
+        chunks,
+        n_single_hop=n_single,
+        n_no_answer=n_no_answer,
+        seed=seed,
+        min_confidence=min_confidence,
+    )
+    write_jsonl(items, out_path)
+    typer.echo(f"\n✔ Wrote {len(items)} eval items to {out_path}")
+    typer.echo(f"  Stats: {stats}")
+    typer.echo(f"\n⚠ This is the RAW set. Now manually review {out_path} → evals/eval_set.jsonl")
 
 
 @app.command()
