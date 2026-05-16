@@ -316,15 +316,103 @@ def query(
     raise typer.Exit(code=1)
 
 
-@app.command()
-def eval(
-    config: str = typer.Option("full", "--config", help="Which retrieval config to evaluate."),
+@app.command(name="eval-retrieval")
+def eval_retrieval(
+    config: str = typer.Option(
+        "hybrid", "--config", "-c", help="Which retriever to evaluate: dense | sparse | hybrid"
+    ),
+    strategy: str = typer.Option(
+        "recursive", "--strategy", "-s", help="Index strategy to evaluate against."
+    ),
+    eval_set: Path = typer.Option(
+        None, "--eval-set", help="Eval set JSONL. Default: evals/eval_set.jsonl"
+    ),
+    top_k: int = typer.Option(10, "--top-k", help="Top-k for retrieval metrics."),
+    rrf_k: int = typer.Option(60, "--rrf-k", help="RRF constant for hybrid."),
+    fan_out_k: int = typer.Option(
+        50, "--fan-out", help="Per-retriever candidates before fusion (hybrid only)."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run the eval suite (RAGAS + custom)."""
+    """Compute Recall@k, MRR@k, nDCG@k against the eval set, save to disk, append ablation row."""
     _setup_logging(verbose)
-    typer.echo(f"Not implemented yet (config={config}) — Week 2.")
-    raise typer.Exit(code=1)
+    settings.ensure_dirs()
+
+    from arxiv_rag.evals import (
+        append_to_ablation_md,
+        evaluate_retriever,
+        format_ablation_row,
+        load_eval_set,
+        save_run,
+    )
+    from arxiv_rag.retrieval import (
+        BM25Store,
+        DenseStore,
+        Embedder,
+        HybridRetriever,
+        bm25_path_for,
+        chunks_table_name,
+    )
+
+    # Resolve eval set path: prefer the reviewed gold set; fall back to raw.
+    eval_path = eval_set or (settings.evals_dir / "eval_set.jsonl")
+    if not eval_path.exists():
+        raw = settings.evals_dir / "eval_set_raw.jsonl"
+        if raw.exists():
+            typer.echo(
+                f"No reviewed set at {eval_path}. Falling back to RAW set: {raw}\n"
+                f"(Reviewed sets give cleaner numbers — do the manual filter pass.)"
+            )
+            eval_path = raw
+        else:
+            typer.echo("No eval set found. Run `arxiv-rag generate-evals` first.")
+            raise typer.Exit(code=1)
+
+    items = load_eval_set(eval_path)
+    typer.echo(f"Loaded {len(items)} eval items from {eval_path}")
+
+    # Build a retrieve_fn for the chosen config. All return list[chunk_id] for the harness.
+    if config == "dense":
+        embedder = Embedder()
+        dense_store = DenseStore(table_name=chunks_table_name(strategy))
+
+        def retrieve_fn(q: str, k: int) -> list[str]:
+            qv = embedder.embed([q], show_progress_bar=False)[0]
+            return [h.chunk_id for h in dense_store.search(qv, k=k)]
+
+    elif config == "sparse":
+        sparse_store = BM25Store(index_path=bm25_path_for(strategy))
+
+        def retrieve_fn(q: str, k: int) -> list[str]:
+            return [h.chunk_id for h in sparse_store.search(q, k=k)]
+
+    elif config == "hybrid":
+        retriever = HybridRetriever(strategy=strategy, rrf_k=rrf_k)
+
+        def retrieve_fn(q: str, k: int) -> list[str]:
+            return [h.chunk_id for h in retriever.search(q, k=k, fan_out_k=fan_out_k)]
+
+    else:
+        typer.echo(f"Unknown config: {config!r}. Use dense | sparse | hybrid.")
+        raise typer.Exit(code=1)
+
+    aggregate, per_query = evaluate_retriever(
+        retrieve_fn, items, config_name=config, strategy=strategy, top_k=top_k
+    )
+
+    runs_dir = settings.evals_dir / "runs"
+    save_run(aggregate, per_query, runs_dir)
+    append_to_ablation_md(aggregate, settings.evals_dir / "ablation.md")
+
+    typer.echo(f"\n=== Results: config={config}, strategy={strategy}, k={top_k} ===")
+    typer.echo(
+        f"Queries evaluated: {aggregate.n_evaluated} (no-answer skipped: {aggregate.n_no_answer})"
+    )
+    typer.echo(f"Recall@{top_k}: {aggregate.recall_at_k:.3f}")
+    typer.echo(f"MRR@{top_k}:    {aggregate.mrr_at_k:.3f}")
+    typer.echo(f"nDCG@{top_k}:   {aggregate.ndcg_at_k:.3f}")
+    typer.echo(f"\nAblation row appended to {settings.evals_dir / 'ablation.md'}:")
+    typer.echo(format_ablation_row(aggregate))
 
 
 if __name__ == "__main__":

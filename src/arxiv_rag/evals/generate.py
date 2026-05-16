@@ -72,7 +72,12 @@ CHUNK:
 
 
 def _call_llm(prompt: str, model: str, temperature: float = 0.3) -> str:
-    """Single LLM call via LiteLLM. Imported lazily."""
+    """Single LLM call via LiteLLM. Imported lazily.
+
+    `num_retries=5` enables LiteLLM's built-in exponential backoff for rate-limit
+    (429) and transient errors. Critical when using free-tier providers like Groq
+    that throttle aggressively on TPM.
+    """
     from litellm import completion
 
     resp = completion(
@@ -80,6 +85,7 @@ def _call_llm(prompt: str, model: str, temperature: float = 0.3) -> str:
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
         max_tokens=400,
+        num_retries=5,
     )
     return resp.choices[0].message.content
 
