@@ -392,8 +392,16 @@ def eval_retrieval(
         def retrieve_fn(q: str, k: int) -> list[str]:
             return [h.chunk_id for h in retriever.search(q, k=k, fan_out_k=fan_out_k)]
 
+    elif config == "rerank":
+        from arxiv_rag.retrieval import RerankingRetriever
+
+        rerank_retriever = RerankingRetriever(strategy=strategy, rrf_k=rrf_k)
+
+        def retrieve_fn(q: str, k: int) -> list[str]:
+            return [h.chunk_id for h in rerank_retriever.search(q, k=k, fan_out_k=fan_out_k)]
+
     else:
-        typer.echo(f"Unknown config: {config!r}. Use dense | sparse | hybrid.")
+        typer.echo(f"Unknown config: {config!r}. Use dense | sparse | hybrid | rerank.")
         raise typer.Exit(code=1)
 
     aggregate, per_query = evaluate_retriever(
