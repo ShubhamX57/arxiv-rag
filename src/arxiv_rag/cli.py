@@ -307,13 +307,64 @@ def generate_evals(
 @app.command()
 def query(
     question: str = typer.Argument(..., help="The question to answer."),
-    config: str = typer.Option("full", "--config", help="naive | hybrid | rerank | full"),
+    config: str = typer.Option(
+        "rerank",
+        "--config",
+        help="Retrieval config: hybrid | rerank | multi-query | hyde",
+    ),
+    top_k: int = typer.Option(5, "--top-k", help="Chunks to feed into the prompt."),
+    strategy: str = typer.Option("recursive", "--strategy", help="Chunking strategy."),
+    show_chunks: bool = typer.Option(
+        False, "--show-chunks", help="Print retrieved chunks alongside the answer."
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run a single query end-to-end."""
+    """Run a single query end-to-end: retrieve, rerank, generate a grounded answer."""
     _setup_logging(verbose)
-    typer.echo(f"Not implemented yet (config={config}, q={question!r}) — Week 2.")
-    raise typer.Exit(code=1)
+    settings.ensure_dirs()
+
+    from arxiv_rag.generation import Generator, RAGPipeline
+    from arxiv_rag.retrieval import RerankingRetriever
+    from arxiv_rag.retrieval.rewriters import RewriteRerankRetriever
+
+    # Build the retriever based on config. We always rerank — generation reads
+    # chunks in prompt order, so we want the cross-encoder to put the best ones
+    # at the top.
+    if config == "rerank" or config == "hybrid":
+        # 'hybrid' here means hybrid+rerank, not pure hybrid — for query answering
+        # you always want the reranker since the LLM reads chunks in order.
+        retriever: object = RerankingRetriever(strategy=strategy)
+    elif config in {"multi-query", "hyde"}:
+        retriever = RewriteRerankRetriever(strategy=config, retrieval_strategy=strategy)
+    else:
+        typer.echo(f"Unknown config: {config!r}. Use hybrid | rerank | multi-query | hyde.")
+        raise typer.Exit(code=1)
+
+    pipeline = RAGPipeline(
+        retriever=retriever,
+        generator=Generator(),
+        top_k_for_generation=top_k,
+    )
+
+    typer.echo(f"\n? {question}\n")
+    typer.echo("Retrieving and generating...")
+    result = pipeline.query(question)
+
+    if show_chunks:
+        typer.echo(f"\n--- Retrieved {len(result.retrieved)} chunks ---")
+        for i, c in enumerate(result.retrieved, start=1):
+            typer.echo(f"\n[{i}] chunk_id={c.chunk_id}  rerank_score={c.rerank_score:.3f}")
+            typer.echo(f"    section: {c.section_title}")
+            text_preview = c.text[:200].replace("\n", " ")
+            typer.echo(f"    text:    {text_preview}{'...' if len(c.text) > 200 else ''}")
+
+    typer.echo("\n--- Answer ---")
+    if result.answer.abstained:
+        typer.echo(f"(abstained) {result.answer.answer}")
+    else:
+        typer.echo(result.answer.answer)
+        if result.answer.citation_chunk_ids:
+            typer.echo(f"\nCitations: {', '.join(result.answer.citation_chunk_ids)}")
 
 
 @app.command(name="eval-retrieval")
