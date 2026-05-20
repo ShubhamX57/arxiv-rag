@@ -1,7 +1,8 @@
 # ArXiv RAG — Production-Grade Retrieval over ML Papers
 
-> Hybrid retrieval (BM25 + dense) over 204 ArXiv ML papers, with a real evaluation harness. Cross-encoder reranking, query rewriting, and generation eval coming next.
+> Hybrid retrieval (BM25 + dense) with cross-encoder reranking over 204 ArXiv ML papers, evaluated end-to-end. Query rewriting and generation eval coming next.
 
+**Status:** Week 1 complete — retrieval + reranking shipped, ablation measured. Week 2 in progress.
 
 ---
 
@@ -11,8 +12,8 @@
 | :---------------------------------- | :-------: | :----: | :-----: | :-: |
 | Sparse only (BM25)                  |   0.921   | 0.781  |  0.816  | 76 |
 | Dense only (BGE-M3 + LanceDB)       |   0.961   | 0.800  |  0.838  | 76 |
-| **Hybrid (RRF fusion, k=60)**       | **0.974** | **0.801** | **0.842** | 76 |
-| + Cross-encoder rerank              |    —      |   —    |    —    | —  |
+| Hybrid (RRF fusion, k=60)           |   0.974   | 0.801  |  0.842  | 76 |
+| **+ Cross-encoder rerank (top-50)** | **1.000** | **0.955** | **0.966** | 76 |
 | + Query rewriting                   |    —      |   —    |    —    | —  |
 
 Eval set: 82 synthetic Q&A pairs (76 single-hop retrieval + 6 no-answer abstention).
@@ -49,20 +50,21 @@ Most RAG demos are single-script notebooks that retrieve top-k and stuff into a 
                               Langfuse traces + RAGAS evals
 ```
 
-Shipped so far: everything from ArXiv API through hybrid retrieval, plus the retrieval eval harness.
-Coming: reranking, query rewriting, generation, citations, observability, API + UI.
+Shipped so far: everything from ArXiv API through hybrid retrieval and cross-encoder reranking, plus the retrieval eval harness.
+Coming: query rewriting, generation, citations, observability, API + UI.
 
 ---
 
 ## Retrieval evaluation
 
-Three retrievers, same corpus and chunking strategy (recursive ~500-token chunks), benchmarked on the same eval set:
+Four retrieval configurations, same corpus and chunking strategy (recursive ~500-token chunks), benchmarked on the same eval set:
 
 | Config | k  | Recall@10 | MRR@10 | nDCG@10 | n  |
 |--------|----|-----------|--------|---------|-----|
 | sparse (BM25)              | 10 | 0.921 | 0.781 | 0.816 | 76 |
 | dense (BGE-M3 + LanceDB)   | 10 | 0.961 | 0.800 | 0.838 | 76 |
-| hybrid (RRF fusion, k=60)  | 10 | **0.974** | **0.801** | **0.842** | 76 |
+| hybrid (RRF fusion, k=60)  | 10 | 0.974 | 0.801 | 0.842 | 76 |
+| **+ rerank (BGE-reranker-v2-m3, top-50)** | 10 | **1.000** | **0.955** | **0.966** | 76 |
 
 **Metrics** (1-indexed ranks):
 
@@ -70,7 +72,11 @@ Three retrievers, same corpus and chunking strategy (recursive ~500-token chunks
 - **MRR@10**: mean of 1/rank-of-first-gold (0 if no gold in top-10)
 - **nDCG@10**: position-weighted gold hits, normalized to [0, 1]
 
-**Reading the table**: hybrid via Reciprocal Rank Fusion outperforms either retriever alone on every metric. The +5.3pp Recall over sparse comes from dense embeddings catching semantic paraphrases that BM25 misses; the +1.3pp Recall over dense comes from BM25 catching specific acronyms and rare terms that dense embeddings sometimes blur. Hybrid's win is small but consistent — typical of well-implemented RRF on a corpus where neither retriever dominates.
+**Reading the table**:
+- **Hybrid via RRF** outperforms either retriever alone by a small but consistent margin. Dense embeddings catch semantic paraphrases that BM25 misses (+4pp Recall); BM25 catches specific acronyms and rare terms that dense embeddings blur (+1.3pp on top of dense).
+- **Cross-encoder reranking is the dominant accuracy lever**, jumping MRR@10 from 0.801 → 0.955 — meaning the gold chunk is at rank 1 for ~95% of queries instead of averaging around rank 1.25. Recall@10 hits a ceiling of 1.0 on this eval set, but the more interesting story is the position improvement: when the LLM downstream reads top-k, it sees the most relevant chunk first.
+
+The reranking gain comes from joint attention across (query, chunk) — the cross-encoder reads both texts together and outputs a relevance score, whereas embeddings encode each independently and compare in vector space. Joint attention is more accurate but can't be pre-computed, so we only run it on the top-50 candidates from hybrid retrieval.
 
 **Reproduce**:
 
@@ -78,6 +84,7 @@ Three retrievers, same corpus and chunking strategy (recursive ~500-token chunks
 uv run arxiv-rag eval-retrieval --config sparse --top-k 10
 uv run arxiv-rag eval-retrieval --config dense  --top-k 10
 uv run arxiv-rag eval-retrieval --config hybrid --top-k 10
+uv run arxiv-rag eval-retrieval --config rerank --top-k 10
 ```
 
 Per-query results land in `evals/runs/`; aggregate rows append to `evals/ablation.md`.
@@ -85,9 +92,10 @@ Per-query results land in `evals/runs/`; aggregate rows append to `evals/ablatio
 **Methodology**:
 
 - Eval questions were generated synthetically (Llama 3.3 70B via Groq) by prompting the LLM on a sampled chunk with a strict JSON schema and confidence threshold. Quality filters discarded ~30% of generations.
-- Questions are **not yet manually reviewed** — numbers will move with a curated set, planned for v0.2.
+- Questions are **not yet manually reviewed** — numbers will move with a curated set, planned for v0.2. Hand-curated evals typically bring rerank MRR down from 0.95 toward ~0.90.
 - No-answer items (n=6) measure abstention behavior, which lives at the generation layer; they're excluded from retrieval metrics.
 - All configurations use identical chunking, so the table isolates retrieval quality from chunking quality.
+- Reranker latency: ~8 seconds per query for 50 candidates on M4 Pro / MPS. Production deployment would need batching or a smaller reranker.
 
 ---
 
@@ -163,7 +171,7 @@ uv run arxiv-rag generate-evals --n-single 100 --n-no-answer 20
 ### 6. Run the retrieval ablation
 
 ```bash
-uv run arxiv-rag eval-retrieval --config hybrid --top-k 10
+uv run arxiv-rag eval-retrieval --config rerank --top-k 10
 ```
 
 ### 7. End-to-end query *(Week 2)*
@@ -188,11 +196,11 @@ arxiv-rag/
 │   ├── config.py           # pydantic-settings, single source of truth
 │   ├── cli.py              # typer entry point
 │   ├── ingest/             # arxiv fetch, PDF parse, chunking
-│   ├── retrieval/          # embedder, dense (LanceDB), sparse (BM25), hybrid (RRF)
+│   ├── retrieval/          # embedder, dense (LanceDB), sparse (BM25), hybrid (RRF), reranker
 │   ├── evals/              # schema, synthetic generation, metrics, harness
 │   ├── generation/         # (Week 2) prompts, LLM client, citations
 │   └── api/                # (Week 3) FastAPI
-├── tests/                  # 152 tests; pytest + mypy + ruff
+├── tests/                  # 163 tests; pytest + mypy + ruff
 ├── evals/                  # eval_set.jsonl, ablation.md, runs/
 ├── notebooks/              # experiments only — not core code
 └── data/                   # gitignored: pdfs, lancedb, metadata, BM25 pickle
@@ -207,9 +215,11 @@ Decisions worth justifying when an interviewer asks "why":
 - **LanceDB** over Chroma/Qdrant: embedded (no server), zero-copy reads via Arrow, fast on Apple Silicon, native cosine similarity. ANN index kicks in above 50k vectors.
 - **BGE-M3** for embeddings: top of MTEB for its size, produces both dense and sparse representations, runs on MPS (Apple Silicon) at reasonable throughput.
 - **Reciprocal Rank Fusion** for hybrid: parameter-free in practice (k=60 from the original paper), avoids the score-calibration problem you get with weighted-sum (cosine in [-1, 1] vs BM25 in [0, ~30] — comparing them directly is meaningless).
+- **BGE-reranker-v2-m3** as the cross-encoder: the canonical partner to BGE-M3 embeddings, trained on the same data distribution. Multilingual, 568M params, runs on MPS.
 - **Recursive chunking** as the default: respects paragraph boundaries when possible, falls back to sentence/word splits, prepends overlap. Produces ~5100 chunks averaging 437 tokens for the 204-paper corpus.
 - **LiteLLM** for generation: lets the LLM provider swap (Anthropic / OpenAI / Gemini / Groq / local Ollama) via one config string. Built-in retry-with-backoff for handling free-tier rate limits.
 - **No-answer items excluded from retrieval metrics**: retrieval measures "did we find the gold chunk?", which has no meaning for a question with no gold chunk. Abstention is a generation-layer concern (Week 2).
+- **fan_out_k=50 for reranking**: caps Recall@10 at whatever Recall@50 of pure hybrid was (~1.0 here), trading compute for headroom. Smaller fan-out is faster but limits the reranker's ceiling.
 
 ---
 
@@ -224,13 +234,13 @@ Current eval set is **synthetic, n=82**. Each item has:
 
 Limitations and what's next:
 
-- Questions aren't manually reviewed yet — v0.2 will trim the synthetic set to ~60 hand-curated items.
-- Multi-hop questions (synthesizing 2+ chunks) aren't generated yet — adding in Week 2 once the reranker is in place.
-- The generator samples chunks randomly; questions tend to inherit the chunk's vocabulary, which biases the eval slightly toward BM25 — actually visible in the numbers (sparse is only ~5pp behind hybrid, smaller gap than typical benchmarks).
+- Questions aren't manually reviewed yet — v0.2 will trim the synthetic set to ~60 hand-curated items. Synthetic evals tend to inflate reranker performance (the gold chunk really is the most relevant in the corpus, by construction); hand-curation typically brings MRR down ~5pp.
+- Multi-hop questions (synthesizing 2+ chunks) aren't generated yet — adding in Week 2.
+- The generator samples chunks randomly; questions tend to inherit the chunk's vocabulary, which biases the eval slightly toward BM25 — visible in the numbers (sparse is only ~5pp behind hybrid, smaller gap than typical benchmarks).
 
 Planned in Week 2:
 
-- **Retrieval**: cross-encoder reranking (BAAI/bge-reranker-v2-m3), query rewriting, HyDE
+- **Retrieval**: query rewriting, HyDE, multi-hop synthesis
 - **Generation**: faithfulness, answer relevance, context precision/recall via RAGAS
 - **Custom**: LLM-as-judge correctness with calibrated rubric, refusal accuracy on no-answer items
 - **Operational**: p50/p95 latency, $ per query
@@ -240,7 +250,7 @@ Planned in Week 2:
 ## Engineering
 
 - Python 3.12, [uv](https://docs.astral.sh/uv/) for env + dependency management
-- 152 tests passing, mypy --strict, ruff lint + format
+- 163 tests passing, mypy --strict, ruff lint + format
 - Pre-commit hooks: trailing whitespace, large-file check, ruff, mypy
 - GitHub Actions CI on every push
 - Branch protection on `main`
