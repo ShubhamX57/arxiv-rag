@@ -400,8 +400,24 @@ def eval_retrieval(
         def retrieve_fn(q: str, k: int) -> list[str]:
             return [h.chunk_id for h in rerank_retriever.search(q, k=k, fan_out_k=fan_out_k)]
 
+    elif config in {"multi-query", "hyde"}:
+        from arxiv_rag.retrieval.rewriters import RewriteRerankRetriever
+
+        rewrite_retriever = RewriteRerankRetriever(
+            strategy=config,
+            retrieval_strategy=strategy,
+            rrf_k=rrf_k,
+            fan_out_per_query=fan_out_k,
+        )
+
+        def retrieve_fn(q: str, k: int) -> list[str]:
+            return [h.chunk_id for h in rewrite_retriever.search(q, k=k)]
+
     else:
-        typer.echo(f"Unknown config: {config!r}. Use dense | sparse | hybrid | rerank.")
+        typer.echo(
+            f"Unknown config: {config!r}. "
+            "Use dense | sparse | hybrid | rerank | multi-query | hyde."
+        )
         raise typer.Exit(code=1)
 
     aggregate, per_query = evaluate_retriever(
