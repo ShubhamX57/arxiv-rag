@@ -591,7 +591,7 @@ def eval_generation(
 
     typer.echo(f"\n=== Generation eval: config={config}, n={n} ===")
     typer.echo(
-        f"Refusal accuracy:      {refusal_accuracy:.3f}  " f"({n_refused}/{n} correctly abstained)"
+        f"Refusal accuracy:      {refusal_accuracy:.3f}  ({n_refused}/{n} correctly abstained)"
     )
     typer.echo(
         f"False-grounding rate:  {false_grounding_rate:.3f}  "

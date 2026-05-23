@@ -134,9 +134,7 @@ def _format_context(chunks: Sequence[RetrievedChunk], max_chars_per_chunk: int =
         if len(text) > max_chars_per_chunk:
             text = text[:max_chars_per_chunk] + "..."
         parts.append(
-            f"[{i}] chunk_id: {c.chunk_id}\n"
-            f"    section: {c.section_title}\n"
-            f"    text: {text}"
+            f"[{i}] chunk_id: {c.chunk_id}\n    section: {c.section_title}\n    text: {text}"
         )
     return "\n\n".join(parts)
 
