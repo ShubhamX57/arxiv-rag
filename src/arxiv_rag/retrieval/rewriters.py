@@ -270,8 +270,12 @@ class RewriteRerankRetriever:
         self._hybrid = hybrid or HybridRetriever(strategy=retrieval_strategy, rrf_k=rrf_k)
         self._reranker = reranker if reranker is not None else get_default_reranker()
 
-    def search(self, query: str, k: int = 10) -> list[RerankedHit]:
-        """Returns RerankedHit list, sorted by rerank_score descending."""
+    def search(self, query: str, k: int = 10, fan_out_k: int | None = None) -> list[RerankedHit]:
+        """Returns RerankedHit list, sorted by rerank_score descending.
+
+        fan_out_k is accepted for interface compatibility with RerankingRetriever
+        but is ignored; use fan_out_per_query in the constructor to control fan-out.
+        """
         result = self._rewrite_fn(query)
 
         # Choose which queries to retrieve with based on strategy:

@@ -1,0 +1,7 @@
+{
+  "config": "multi-query",
+  "n": 10,
+  "refusal_accuracy": 1.0,
+  "false_grounding_rate": 0.0,
+  "timestamp": "2026-05-23T13-39-35-223474+00-00"
+}

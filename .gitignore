@@ -49,8 +49,14 @@ data/*.pkl
 data/*.parquet
 !data/.gitkeep
 
-# Eval runs
-evals/runs/
+# Eval runs: ignore per-query traces (large, reproducible) but commit small
+# generation-eval aggregates. To use a negation under a directory, the directory
+# itself must NOT be ignored — match files within it instead.
+evals/runs/*.jsonl
+evals/runs/*.json
+# Exceptions: small generation-eval artifacts back the README ablation numbers
+!evals/runs/generation_*.json
+!evals/runs/generation_*.jsonl
 !evals/.gitkeep
 
 # Secrets

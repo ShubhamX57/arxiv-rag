@@ -1,0 +1,7 @@
+{
+  "config": "rerank",
+  "n": 10,
+  "refusal_accuracy": 1.0,
+  "false_grounding_rate": 0.0,
+  "timestamp": "2026-05-23T09-51-19-298914+00-00"
+}

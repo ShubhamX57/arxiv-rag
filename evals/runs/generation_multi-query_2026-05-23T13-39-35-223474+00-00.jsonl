@@ -1,0 +1,10 @@
+{"id": "adv-0001", "question": "What is the capital of France?", "refused": true, "answer": "The passages do not explicitly state the capital of France.", "n_citations": 0, "citations": []}
+{"id": "adv-0002", "question": "Who won the 2024 US presidential election?", "refused": true, "answer": "The passages do not mention the 2024 US presidential election.", "n_citations": 0, "citations": []}
+{"id": "adv-0003", "question": "How tall is Mount Everest in meters?", "refused": true, "answer": "The height of Mount Everest is not mentioned in the provided passages.", "n_citations": 0, "citations": []}
+{"id": "adv-0004", "question": "What year was the Eiffel Tower built?", "refused": true, "answer": "The year the Eiffel Tower was built is not mentioned in the passages.", "n_citations": 0, "citations": []}
+{"id": "adv-0005", "question": "What is the boiling point of water in Fahrenheit?", "refused": true, "answer": "The boiling point of water in Fahrenheit is not mentioned in the passages.", "n_citations": 0, "citations": []}
+{"id": "adv-0006", "question": "Who is the CEO of OpenAI?", "refused": true, "answer": "The passages do not mention the CEO of OpenAI.", "n_citations": 0, "citations": []}
+{"id": "adv-0007", "question": "How many planets are in our solar system?", "refused": true, "answer": "The number of planets in our solar system is not mentioned in the provided passages.", "n_citations": 0, "citations": []}
+{"id": "adv-0008", "question": "What is the chemical formula for water?", "refused": true, "answer": "The chemical formula for water is not mentioned in the passages.", "n_citations": 0, "citations": []}
+{"id": "adv-0009", "question": "When was Python first released?", "refused": true, "answer": "The passages do not mention when Python was first released.", "n_citations": 0, "citations": []}
+{"id": "adv-0010", "question": "What is the speed of light in a vacuum?", "refused": true, "answer": "The speed of light in a vacuum is not mentioned in the passages.", "n_citations": 0, "citations": []}
