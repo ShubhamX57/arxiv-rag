@@ -27,6 +27,7 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import pymupdf
 from tqdm import tqdm
@@ -168,7 +169,7 @@ def _flush_section(
 def parse_pdf(pdf_path: Path, paper_id: str) -> list[Section]:
     """Parse one PDF into a list of sections. Returns [] on failure."""
     try:
-        doc = pymupdf.open(pdf_path)
+        doc: Any = pymupdf.open(pdf_path)  # type: ignore[no-untyped-call,unused-ignore]  # type: ignore[no-untyped-call,unused-ignore]  # type: ignore[no-untyped-call,unused-ignore]
     except Exception as e:
         log.warning("Failed to open %s: %s", pdf_path, e)
         return []

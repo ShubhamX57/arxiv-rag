@@ -32,7 +32,6 @@ jobs:
 
       - name: Type check (mypy)
         run: uv run mypy src
-        continue-on-error: true  # remove once codebase is fully typed
 
       - name: Test
         run: uv run pytest -m "not slow and not integration"

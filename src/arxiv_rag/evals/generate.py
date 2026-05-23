@@ -17,7 +17,7 @@ import random
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from tqdm import tqdm
 
@@ -87,7 +87,7 @@ def _call_llm(prompt: str, model: str, temperature: float = 0.3) -> str:
         max_tokens=400,
         num_retries=5,
     )
-    return resp.choices[0].message.content
+    return str(resp.choices[0].message.content)
 
 
 def _parse_json_response(raw: str) -> dict[str, Any] | None:
@@ -99,7 +99,7 @@ def _parse_json_response(raw: str) -> dict[str, Any] | None:
     if not match:
         return None
     try:
-        return json.loads(match.group(0))
+        return cast("dict[str, Any]", json.loads(match.group(0)))
     except json.JSONDecodeError:
         return None
 

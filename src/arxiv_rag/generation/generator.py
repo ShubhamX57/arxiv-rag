@@ -305,7 +305,7 @@ def _call_llm(prompt: str, model: str, temperature: float = 0.0) -> str:
         max_tokens=600,
         num_retries=5,
     )
-    return resp.choices[0].message.content
+    return str(resp.choices[0].message.content)
 
 
 # ----------------------- public API -----------------------

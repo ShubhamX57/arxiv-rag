@@ -43,11 +43,12 @@ class RAGPipeline:
         self.fan_out_for_rerank = fan_out_for_rerank
 
     def retrieve(self, question: str) -> list[RerankedHit]:
-        return self.retriever.search(
+        hits: list[RerankedHit] = self.retriever.search(
             question,
             k=self.top_k_for_generation,
             fan_out_k=self.fan_out_for_rerank,
         )
+        return hits
 
     def answer(self, question: str, chunks: Sequence[RetrievedChunk]) -> GeneratedAnswer:
         return self.generator.answer(question, chunks)
