@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 import logging
+from datetime import UTC
 from pathlib import Path
+from typing import Any
 
 import typer
 
@@ -312,7 +314,7 @@ def query(
         "--config",
         help="Retrieval config: hybrid | rerank | multi-query | hyde",
     ),
-    top_k: int = typer.Option(5, "--top-k", help="Chunks to feed into the prompt."),
+    top_k: int = typer.Option(3, "--top-k", help="Chunks to feed into the prompt."),
     strategy: str = typer.Option("recursive", "--strategy", help="Chunking strategy."),
     show_chunks: bool = typer.Option(
         False, "--show-chunks", help="Print retrieved chunks alongside the answer."
@@ -327,12 +329,7 @@ def query(
     from arxiv_rag.retrieval import RerankingRetriever
     from arxiv_rag.retrieval.rewriters import RewriteRerankRetriever
 
-    # Build the retriever based on config. We always rerank — generation reads
-    # chunks in prompt order, so we want the cross-encoder to put the best ones
-    # at the top.
-    if config == "rerank" or config == "hybrid":
-        # 'hybrid' here means hybrid+rerank, not pure hybrid — for query answering
-        # you always want the reranker since the LLM reads chunks in order.
+    if config in {"rerank", "hybrid"}:
         retriever: object = RerankingRetriever(strategy=strategy)
     elif config in {"multi-query", "hyde"}:
         retriever = RewriteRerankRetriever(strategy=config, retrieval_strategy=strategy)
@@ -363,8 +360,11 @@ def query(
         typer.echo(f"(abstained) {result.answer.answer}")
     else:
         typer.echo(result.answer.answer)
-        if result.answer.citation_chunk_ids:
-            typer.echo(f"\nCitations: {', '.join(result.answer.citation_chunk_ids)}")
+        if result.answer.citations:
+            typer.echo("\nGrounded in:")
+            for cit in result.answer.citations:
+                typer.echo(f"  - {cit.chunk_id}")
+                typer.echo(f'    "{cit.supporting_quote}"')
 
 
 @app.command(name="eval-retrieval")
@@ -488,6 +488,116 @@ def eval_retrieval(
     typer.echo(f"nDCG@{top_k}:   {aggregate.ndcg_at_k:.3f}")
     typer.echo(f"\nAblation row appended to {settings.evals_dir / 'ablation.md'}:")
     typer.echo(format_ablation_row(aggregate))
+
+
+@app.command(name="eval-generation")
+def eval_generation(
+    eval_set: Path = typer.Option(
+        None,
+        "--eval-set",
+        help="JSONL eval set with no_answer items. Default: evals/adversarial.jsonl",
+    ),
+    config: str = typer.Option(
+        "rerank", "--config", help="Retrieval config: rerank | multi-query | hyde"
+    ),
+    strategy: str = typer.Option("recursive", "--strategy"),
+    top_k: int = typer.Option(3, "--top-k"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Measure refusal accuracy on out-of-corpus questions."""
+    _setup_logging(verbose)
+    settings.ensure_dirs()
+
+    import json
+    from datetime import datetime
+
+    from arxiv_rag.evals.schema import QuestionType, load_eval_set
+    from arxiv_rag.generation import Generator, RAGPipeline
+    from arxiv_rag.retrieval import RerankingRetriever
+    from arxiv_rag.retrieval.rewriters import RewriteRerankRetriever
+
+    eval_path = eval_set or (settings.evals_dir / "adversarial.jsonl")
+    if not eval_path.exists():
+        typer.echo(f"Eval set not found at {eval_path}")
+        raise typer.Exit(code=1)
+
+    items = load_eval_set(eval_path)
+    no_answer_items = [i for i in items if i.type == QuestionType.NO_ANSWER]
+    if not no_answer_items:
+        typer.echo("No NO_ANSWER items in the eval set.")
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Loaded {len(no_answer_items)} no-answer items from {eval_path}")
+
+    if config in {"rerank", "hybrid"}:
+        retriever: object = RerankingRetriever(strategy=strategy)
+    elif config in {"multi-query", "hyde"}:
+        retriever = RewriteRerankRetriever(strategy=config, retrieval_strategy=strategy)
+    else:
+        typer.echo(f"Unknown config: {config!r}")
+        raise typer.Exit(code=1)
+
+    pipeline = RAGPipeline(retriever=retriever, generator=Generator(), top_k_for_generation=top_k)
+
+    n_refused = 0
+    n_false_grounded = 0
+    per_query: list[dict[str, Any]] = []
+
+    for item in no_answer_items:
+        result = pipeline.query(item.question)
+        refused = result.answer.abstained
+        if refused:
+            n_refused += 1
+        if not refused and result.answer.citations:
+            n_false_grounded += 1
+        per_query.append(
+            {
+                "id": item.id,
+                "question": item.question,
+                "refused": refused,
+                "answer": result.answer.answer,
+                "n_citations": len(result.answer.citations),
+                "citations": [
+                    {"chunk_id": c.chunk_id, "supporting_quote": c.supporting_quote}
+                    for c in result.answer.citations
+                ],
+            }
+        )
+
+    n = len(no_answer_items)
+    refusal_accuracy = n_refused / n
+    false_grounding_rate = n_false_grounded / n
+
+    ts = datetime.now(UTC).isoformat().replace(":", "-").replace(".", "-")
+    out_dir = settings.evals_dir / "runs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    per_q_path = out_dir / f"generation_{config}_{ts}.jsonl"
+    agg_path = out_dir / f"generation_{config}_{ts}.json"
+    with per_q_path.open("w") as f:
+        for row in per_query:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with agg_path.open("w") as f:
+        json.dump(
+            {
+                "config": config,
+                "n": n,
+                "refusal_accuracy": refusal_accuracy,
+                "false_grounding_rate": false_grounding_rate,
+                "timestamp": ts,
+            },
+            f,
+            indent=2,
+        )
+
+    typer.echo(f"\n=== Generation eval: config={config}, n={n} ===")
+    typer.echo(
+        f"Refusal accuracy:      {refusal_accuracy:.3f}  " f"({n_refused}/{n} correctly abstained)"
+    )
+    typer.echo(
+        f"False-grounding rate:  {false_grounding_rate:.3f}  "
+        f"({n_false_grounded}/{n} answered with fake citations)"
+    )
+    typer.echo(f"\nPer-query results: {per_q_path}")
 
 
 if __name__ == "__main__":

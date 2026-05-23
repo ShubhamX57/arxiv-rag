@@ -1,25 +1,35 @@
-"""Answer generation with grounding and abstention.
+"""Answer generation with grounding, abstention, and verbatim quote verification.
 
-The generator's job: given a question and a list of retrieved chunks, produce a
-grounded answer plus the chunks that support it. Or abstain if the chunks don't
-contain the answer.
+This is the Day 11 version. The Day 10 generator had a known failure mode:
+citation-justified hallucination. The LLM would invent answers using outside
+knowledge and then attach a plausible-looking citation to a chunk that
+contained relevant words but did NOT state the answer. Example:
 
-Three guarantees in the output:
+    Q: "What is the capital of France?"
+    A: "Paris, as associations between 'Paris' and 'France' are mentioned."
+    Citations: [some chunk that mentioned Paris in another context]
 
-1. **Grounded by design**: the prompt explicitly tells the LLM to use ONLY the
-   provided chunks and to cite which ones support each claim. This doesn't
-   eliminate hallucination — only evaluation does — but it gives the LLM the
-   right priors.
-2. **Calibrated abstention**: there's an explicit `abstained` boolean in the
-   output schema. The LLM has to choose: answer with citations, or refuse.
-   This is what makes the no-answer eval items measurable.
-3. **Structured output**: JSON schema means we can parse reliably without
-   regex-hunting for citation markers. Tradeoff: prose is slightly stiffer
-   than free-form, but evaluation is far more robust.
+Three changes fix this:
 
-We use LiteLLM so the same `LLM_MODEL` from .env that drives eval generation
-and query rewriting also drives answer generation — one provider switch flips
-everything to a different model.
+1. **Tighter prompt**. The Day 10 prompt said "use only the passages."
+   The new prompt is more specific: do not infer, do not associate, do not
+   bridge across chunks unless the bridge is itself stated. If the answer
+   requires reasoning beyond what the passages explicitly state, abstain.
+
+2. **Verbatim supporting quote**. The LLM must now produce, for each
+   citation, the exact sentence from that chunk that supports the answer.
+   We then verify the quote appears verbatim in the chunk text. If it
+   doesn't, the citation is dropped. If all citations are dropped, we
+   abstain. This catches the "decorative citation" pattern directly.
+
+3. **Stricter post-processing**. An answer with zero verified citations is
+   converted to an abstention regardless of what the LLM said about
+   `abstained`. The LLM doesn't get to claim grounding if the grounding
+   doesn't actually exist.
+
+The verbatim check uses a normalized substring match — whitespace and case
+are ignored, but the words and their order must match. This catches actual
+fabrications without being defeated by trivial formatting differences.
 """
 
 from __future__ import annotations
@@ -40,55 +50,72 @@ log = logging.getLogger(__name__)
 
 DEFAULT_GENERATOR_MODEL = settings.llm_model
 
-
-# A retrieved chunk that's been formatted for the prompt context. We accept either
-# a FusedHit (hybrid output) or RerankedHit (rerank output) so the generator
-# composes cleanly with any retriever in the ablation table.
 RetrievedChunk = FusedHit | RerankedHit
+
+
+@dataclass(frozen=True, slots=True)
+class Citation:
+    """One verified citation: which chunk, and the exact supporting sentence
+    from that chunk. Verified means the quote was found verbatim in the chunk
+    text (modulo whitespace/case normalization)."""
+
+    chunk_id: str
+    supporting_quote: str
 
 
 @dataclass(frozen=True, slots=True)
 class GeneratedAnswer:
     """Structured output from the generator.
 
-    If `abstained=True`, `answer` will typically be a short refusal message
-    ("The provided context does not contain enough information to answer this
-    question") and `citation_chunk_ids` will be empty. The downstream eval can
-    check `abstained` directly without parsing the prose.
+    Citations now carry verified quotes, not just chunk_ids. If a citation
+    survives in this list, the quote was found in the corresponding chunk.
     """
 
     question: str
     answer: str
-    citation_chunk_ids: list[str]
+    citations: list[Citation]
     abstained: bool
     model: str
-    # Raw LLM response for debugging — useful when an answer looks wrong and you
-    # want to see whether the LLM ignored its instructions vs. the parser dropped
-    # something.
     raw_response: str
+
+    @property
+    def citation_chunk_ids(self) -> list[str]:
+        """Backwards-compat helper for code that only wants the ids."""
+        return [c.chunk_id for c in self.citations]
 
 
 # ----------------------- prompt -----------------------
 
 
 SYSTEM_INSTRUCTIONS = """You are a research assistant answering questions about \
-machine learning papers. You will be given a question and several passages \
-retrieved from an ML paper corpus. Follow these rules strictly:
+machine learning papers using ONLY the passages provided in the user message.
 
-1. Use ONLY the information in the provided passages. Do not use outside knowledge.
-2. If the passages do not contain enough information to answer the question, \
-set "abstained" to true and explain briefly what is missing.
-3. Cite the passages you used by their chunk_id. Only cite passages that \
-directly support a claim in your answer.
-4. Keep the answer concise (2-5 sentences). Prefer the exact technical \
-vocabulary used in the passages.
+Rules:
+1. Use ONLY information explicitly stated in the passages. Do not use any \
+outside knowledge. Do not infer facts that are not directly stated. Do not \
+combine information across passages unless the combination is itself stated.
+2. For EVERY claim in your answer, identify the exact sentence from a passage \
+that supports that claim. Quote it verbatim.
+3. If the passages do not explicitly state the answer, set "abstained" to \
+true and briefly explain what is missing. The fact that a passage mentions \
+related words is NOT sufficient to answer — the passage must state the answer.
+4. Keep the answer concise (2-4 sentences). Use the technical vocabulary from \
+the passages.
 
-Output ONLY a JSON object matching this schema, with no other text:
+Output ONLY a JSON object with this exact schema, with no other text:
 {
-  "answer": "your 2-5 sentence answer, or a brief explanation of what's missing if abstaining",
+  "answer": "your concise answer, or a brief explanation if abstaining",
   "abstained": false,
-  "citation_chunk_ids": ["chunk_id_1", "chunk_id_2"]
-}"""
+  "citations": [
+    {
+      "chunk_id": "the chunk_id you used",
+      "supporting_quote": "verbatim sentence from that chunk that directly states a claim in your answer"
+    }
+  ]
+}
+
+If you cannot find a verbatim sentence in the passages that supports a claim, \
+do not make that claim. If you cannot make any supported claim, abstain."""
 
 
 USER_TEMPLATE = """Question: {question}
@@ -100,20 +127,16 @@ Answer (JSON only):"""
 
 
 def _format_context(chunks: Sequence[RetrievedChunk], max_chars_per_chunk: int = 1500) -> str:
-    """Format chunks into a numbered context block.
-
-    Each chunk is shown with its chunk_id (so the LLM can cite it) and a short
-    section_title for grounding. Long chunks are truncated to keep total prompt
-    length manageable; cross-encoder reranking has already put the most-relevant
-    parts at the top of the list, so this is safe.
-    """
+    """Format chunks for the prompt with chunk_id and section title visible."""
     parts: list[str] = []
     for i, c in enumerate(chunks, start=1):
         text = c.text
         if len(text) > max_chars_per_chunk:
             text = text[:max_chars_per_chunk] + "..."
         parts.append(
-            f"[{i}] chunk_id: {c.chunk_id}\n    section: {c.section_title}\n    text: {text}"
+            f"[{i}] chunk_id: {c.chunk_id}\n"
+            f"    section: {c.section_title}\n"
+            f"    text: {text}"
         )
     return "\n\n".join(parts)
 
@@ -122,12 +145,7 @@ def _format_context(chunks: Sequence[RetrievedChunk], max_chars_per_chunk: int =
 
 
 def _parse_response(raw: str) -> dict[str, Any] | None:
-    """Pull a JSON object out of the LLM response.
-
-    LLMs sometimes wrap output in ```json fences or trailing prose. This strips
-    that and parses what's left. Returns None on any parse failure rather than
-    raising — callers handle the fallback.
-    """
+    """Extract a JSON object from raw LLM output. Returns None on failure."""
     cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
     cleaned = re.sub(r"```\s*$", "", cleaned)
     start = cleaned.find("{")
@@ -143,63 +161,130 @@ def _parse_response(raw: str) -> dict[str, Any] | None:
     return parsed
 
 
+# ----------------------- verbatim quote verification -----------------------
+
+
+def _normalize_for_match(s: str) -> str:
+    """Collapse whitespace and lowercase, for fuzzy substring matching.
+
+    We don't want trivial formatting differences (line breaks, double spaces)
+    to make a legitimate quote fail verification. But we DO want word order
+    and word identity preserved — that's what proves the LLM didn't fabricate
+    the quote.
+    """
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _quote_appears_in(quote: str, chunk_text: str, min_chars: int = 15) -> bool:
+    """Does `quote` appear (modulo whitespace/case) in `chunk_text`?
+
+    Short quotes (< min_chars) are rejected even if they technically match —
+    a 5-character quote is essentially meaningless as "support". This catches
+    the failure mode where an LLM quotes one word and calls it support.
+    """
+    if len(quote.strip()) < min_chars:
+        return False
+    normalized_quote = _normalize_for_match(quote)
+    normalized_chunk = _normalize_for_match(chunk_text)
+    if not normalized_quote:
+        return False
+    return normalized_quote in normalized_chunk
+
+
+def _verify_citations(
+    raw_citations: list[Any],
+    chunks_by_id: dict[str, str],
+) -> list[Citation]:
+    """Keep only citations whose supporting_quote appears verbatim in the
+    corresponding chunk. Drops citations that fail any check.
+    """
+    verified: list[Citation] = []
+    seen_chunk_ids: set[str] = set()
+
+    for raw in raw_citations:
+        if not isinstance(raw, dict):
+            continue
+        chunk_id = str(raw.get("chunk_id", "")).strip()
+        quote = str(raw.get("supporting_quote", "")).strip()
+
+        if not chunk_id or not quote:
+            continue
+        if chunk_id not in chunks_by_id:
+            log.info("Citation rejected: chunk_id %r not in context", chunk_id)
+            continue
+        if chunk_id in seen_chunk_ids:
+            continue  # dedupe by chunk_id; the first verified quote wins
+        if not _quote_appears_in(quote, chunks_by_id[chunk_id]):
+            log.info(
+                "Citation rejected: supporting_quote not found verbatim in chunk %s. quote=%r",
+                chunk_id,
+                quote[:120],
+            )
+            continue
+
+        seen_chunk_ids.add(chunk_id)
+        verified.append(Citation(chunk_id=chunk_id, supporting_quote=quote))
+
+    return verified
+
+
 def _coerce_to_answer(
     question: str,
     parsed: dict[str, Any] | None,
     raw: str,
     model: str,
-    available_chunk_ids: set[str],
+    chunks_by_id: dict[str, str],
 ) -> GeneratedAnswer:
-    """Convert a parsed dict (or None) into a GeneratedAnswer, defending against
-    bad output.
+    """Convert parsed LLM output into a GeneratedAnswer with verified citations.
 
-    `available_chunk_ids` is the set of chunk_ids that were actually in the
-    context. We filter out citations to chunk_ids the LLM hallucinated — this
-    happens occasionally even with strict prompts.
+    If verification leaves no citations, the answer is converted to abstention
+    regardless of what the LLM claimed. Grounding cannot be self-certified.
     """
     if parsed is None:
-        log.warning("Generator: unparseable response; treating as abstention. raw=%r", raw[:300])
+        log.warning("Generator: unparseable response; abstaining. raw=%r", raw[:300])
         return GeneratedAnswer(
             question=question,
             answer="(generation failed: response was not valid JSON)",
-            citation_chunk_ids=[],
+            citations=[],
             abstained=True,
             model=model,
             raw_response=raw,
         )
 
     answer = str(parsed.get("answer", "")).strip()
-    abstained = bool(parsed.get("abstained", False))
-    raw_citations = parsed.get("citation_chunk_ids", [])
+    llm_claimed_abstained = bool(parsed.get("abstained", False))
+
+    raw_citations = parsed.get("citations", [])
     if not isinstance(raw_citations, list):
         raw_citations = []
 
-    # Keep only citations that actually appeared in our context. Dedupe in order.
-    seen: set[str] = set()
-    citations: list[str] = []
-    for c in raw_citations:
-        cid = str(c).strip()
-        if cid and cid in available_chunk_ids and cid not in seen:
-            seen.add(cid)
-            citations.append(cid)
+    citations = _verify_citations(raw_citations, chunks_by_id)
 
-    # Sanity: a non-abstained answer should have at least one citation. If the
-    # LLM said abstained=false but cited nothing, treat it as a soft failure
-    # rather than trusting the answer — better to abstain than to hallucinate.
-    if not abstained and not citations:
-        log.info(
-            "Generator: claimed non-abstention but cited nothing; converting to abstention. q=%r",
-            question[:80],
+    # Hard rule: an answer without verified citations is an abstention. The LLM
+    # doesn't get to claim it answered the question if the grounding doesn't hold.
+    if not citations:
+        if not llm_claimed_abstained:
+            log.info(
+                "Generator: no verified citations; converting claimed answer to abstention. q=%r",
+                question[:80],
+            )
+        return GeneratedAnswer(
+            question=question,
+            answer=answer
+            or "(insufficient context: no verifiable grounding in retrieved passages)",
+            citations=[],
+            abstained=True,
+            model=model,
+            raw_response=raw,
         )
-        abstained = True
-        if not answer:
-            answer = "(insufficient context: model cited no passages)"
 
     return GeneratedAnswer(
         question=question,
         answer=answer,
-        citation_chunk_ids=citations,
-        abstained=abstained,
+        citations=citations,
+        abstained=llm_claimed_abstained,
         model=model,
         raw_response=raw,
     )
@@ -209,12 +294,7 @@ def _coerce_to_answer(
 
 
 def _call_llm(prompt: str, model: str, temperature: float = 0.0) -> str:
-    """LLM completion via LiteLLM with retry-with-backoff.
-
-    Temperature 0 by default — for generation we want determinism so the same
-    (question, chunks) always produces the same answer. That makes evaluation
-    repeatable and bugs reproducible.
-    """
+    """LLM completion via LiteLLM. Temperature 0 for repeatable evals."""
     from litellm import completion
 
     resp = completion(
@@ -234,10 +314,11 @@ def _call_llm(prompt: str, model: str, temperature: float = 0.0) -> str:
 
 
 class Generator:
-    """Answer a question from retrieved chunks.
+    """Answer a question from retrieved chunks with verified grounding.
 
-    Stateless except for the model name — instantiate once and call `answer()`
-    many times. Tests inject `llm_fn` to avoid real LLM calls.
+    Day 11: every citation in the output has been verified to contain a
+    verbatim supporting quote from the cited chunk. If no citations survive
+    verification, the answer is converted to an abstention.
     """
 
     def __init__(
@@ -253,12 +334,11 @@ class Generator:
         question: str,
         chunks: Sequence[RetrievedChunk],
     ) -> GeneratedAnswer:
-        """Generate a grounded answer from `chunks`. Abstain if grounding fails."""
         if not chunks:
             return GeneratedAnswer(
                 question=question,
                 answer="(no context retrieved)",
-                citation_chunk_ids=[],
+                citations=[],
                 abstained=True,
                 model=self.model,
                 raw_response="",
@@ -266,7 +346,7 @@ class Generator:
 
         context = _format_context(chunks)
         prompt = USER_TEMPLATE.format(question=question, context=context)
-        available_ids = {c.chunk_id for c in chunks}
+        chunks_by_id = {c.chunk_id: c.text for c in chunks}
 
         try:
             raw = self._llm_fn(prompt, self.model)
@@ -275,21 +355,22 @@ class Generator:
             return GeneratedAnswer(
                 question=question,
                 answer="(generation failed: LLM call raised an exception)",
-                citation_chunk_ids=[],
+                citations=[],
                 abstained=True,
                 model=self.model,
                 raw_response="",
             )
 
         parsed = _parse_response(raw)
-        return _coerce_to_answer(question, parsed, raw, self.model, available_ids)
+        return _coerce_to_answer(question, parsed, raw, self.model, chunks_by_id)
 
 
 __all__ = [
     "DEFAULT_GENERATOR_MODEL",
-    "SYSTEM_INSTRUCTIONS",
-    "USER_TEMPLATE",
+    "Citation",
     "GeneratedAnswer",
     "Generator",
     "RetrievedChunk",
+    "SYSTEM_INSTRUCTIONS",
+    "USER_TEMPLATE",
 ]
