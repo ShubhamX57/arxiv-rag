@@ -367,10 +367,10 @@ class Generator:
 
 __all__ = [
     "DEFAULT_GENERATOR_MODEL",
+    "SYSTEM_INSTRUCTIONS",
+    "USER_TEMPLATE",
     "Citation",
     "GeneratedAnswer",
     "Generator",
     "RetrievedChunk",
-    "SYSTEM_INSTRUCTIONS",
-    "USER_TEMPLATE",
 ]
