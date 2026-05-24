@@ -600,5 +600,183 @@ def eval_generation(
     typer.echo(f"\nPer-query results: {per_q_path}")
 
 
+@app.command(name="eval-ragas")
+def eval_ragas(
+    config: str = typer.Option(
+        "rerank",
+        "--config",
+        help="Retrieval config: rerank | multi-query | hyde",
+    ),
+    n_items: int = typer.Option(30, "--n-items", help="Number of single-hop items to score."),
+    strategy: str = typer.Option("recursive", "--strategy"),
+    top_k: int = typer.Option(3, "--top-k"),
+    seed: int = typer.Option(42, "--seed", help="Sampling seed for item selection."),
+    eval_set: Path = typer.Option(
+        None, "--eval-set", help="Path to eval set JSONL. Default: evals/eval_set.jsonl"
+    ),
+    judge_model: str = typer.Option(
+        None,
+        "--judge-model",
+        help="LiteLLM model string for the judge. Default: settings.judge_model.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Score faithfulness + answer relevance via an LLM judge.
+
+    For each of N sampled single-hop items:
+      1. Run the full RAG pipeline to produce an answer + retrieved chunks.
+      2. Score faithfulness: fraction of atomic claims in the answer that
+         the judge says are supported by the retrieved context.
+      3. Score answer relevance: mean cosine similarity between the original
+         question and N reverse-generated questions the answer would respond
+         to.
+
+    Defaults to Claude as the judge (cross-family with the Llama generator)
+    to break self-validation bias.
+    """
+    _setup_logging(verbose)
+    settings.ensure_dirs()
+
+    import json
+    import random
+    from datetime import datetime
+
+    from arxiv_rag.evals.ragas import (
+        default_judge_fn,
+        score_answer_relevance,
+        score_faithfulness,
+    )
+    from arxiv_rag.evals.schema import QuestionType, load_eval_set
+    from arxiv_rag.generation import Generator, RAGPipeline
+    from arxiv_rag.retrieval import RerankingRetriever
+    from arxiv_rag.retrieval.embedder import Embedder
+    from arxiv_rag.retrieval.rewriters import RewriteRerankRetriever
+
+    eval_path = eval_set or (settings.evals_dir / "eval_set.jsonl")
+    if not eval_path.exists():
+        typer.echo(f"Eval set not found at {eval_path}")
+        raise typer.Exit(code=1)
+
+    all_items = load_eval_set(eval_path)
+    single_hop = [i for i in all_items if i.type == QuestionType.SINGLE_HOP]
+    if not single_hop:
+        typer.echo("No SINGLE_HOP items in the eval set.")
+        raise typer.Exit(code=1)
+
+    rng = random.Random(seed)
+    sampled = rng.sample(single_hop, k=min(n_items, len(single_hop)))
+    typer.echo(f"Scoring {len(sampled)} items (config={config}, judge=default)")
+
+    if config in {"rerank", "hybrid"}:
+        retriever: object = RerankingRetriever(strategy=strategy)
+    elif config in {"multi-query", "hyde"}:
+        retriever = RewriteRerankRetriever(strategy=config, retrieval_strategy=strategy)
+    else:
+        typer.echo(f"Unknown config: {config!r}")
+        raise typer.Exit(code=1)
+
+    pipeline = RAGPipeline(retriever=retriever, generator=Generator(), top_k_for_generation=top_k)
+    embedder = Embedder()
+
+    # Optional judge model override at the CLI level
+    if judge_model:
+        from arxiv_rag.evals import ragas as ragas_module
+
+        def judge_fn(prompt: str) -> str:
+            return ragas_module._call_judge_llm(prompt, model=judge_model)
+    else:
+        judge_fn = default_judge_fn
+
+    rows: list[dict[str, Any]] = []
+    n_abstained = 0
+
+    for idx, item in enumerate(sampled, start=1):
+        typer.echo(f"  [{idx}/{len(sampled)}] {item.id}: {item.question[:80]}...")
+        result = pipeline.query(item.question)
+
+        if result.answer.abstained:
+            # Faithfulness on an abstention is vacuously 1.0; relevance is
+            # meaningful (does the abstention text address the question?).
+            n_abstained += 1
+            faithfulness_score = 1.0
+            faithfulness_claims: list[str] = []
+            faithfulness_supported: list[bool] = []
+        else:
+            context_chunks = [c.text for c in result.retrieved]
+            f_result = score_faithfulness(
+                item.question, result.answer.answer, context_chunks, judge_fn
+            )
+            faithfulness_score = f_result.score
+            faithfulness_claims = f_result.claims
+            faithfulness_supported = f_result.supported
+
+        r_result = score_answer_relevance(
+            item.question, result.answer.answer, judge_fn, embedder=embedder
+        )
+
+        rows.append(
+            {
+                "id": item.id,
+                "question": item.question,
+                "abstained": result.answer.abstained,
+                "answer": result.answer.answer,
+                "n_chunks": len(result.retrieved),
+                "n_citations": len(result.answer.citations),
+                "faithfulness": faithfulness_score,
+                "faithfulness_claims": faithfulness_claims,
+                "faithfulness_supported": faithfulness_supported,
+                "answer_relevance": r_result.score,
+                "reverse_questions": r_result.generated_questions,
+            }
+        )
+
+    # Aggregate. Mean faithfulness excludes abstentions only when computing
+    # the "answered-only" view; the headline mean includes them (since
+    # abstention contributes 1.0 by definition).
+    n = len(rows)
+    mean_faith = sum(r["faithfulness"] for r in rows) / n
+    mean_rel = sum(r["answer_relevance"] for r in rows) / n
+    answered = [r for r in rows if not r["abstained"]]
+    mean_faith_answered = (
+        sum(r["faithfulness"] for r in answered) / len(answered) if answered else 0.0
+    )
+    mean_rel_answered = (
+        sum(r["answer_relevance"] for r in answered) / len(answered) if answered else 0.0
+    )
+
+    ts = datetime.now(UTC).isoformat().replace(":", "-").replace(".", "-")
+    out_dir = settings.evals_dir / "runs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    per_path = out_dir / f"ragas_{config}_{ts}.jsonl"
+    agg_path = out_dir / f"ragas_{config}_{ts}.json"
+    with per_path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with agg_path.open("w") as f:
+        json.dump(
+            {
+                "config": config,
+                "n": n,
+                "n_abstained": n_abstained,
+                "mean_faithfulness": mean_faith,
+                "mean_faithfulness_answered_only": mean_faith_answered,
+                "mean_answer_relevance": mean_rel,
+                "mean_answer_relevance_answered_only": mean_rel_answered,
+                "timestamp": ts,
+                "judge_model": judge_model or "default",
+            },
+            f,
+            indent=2,
+        )
+
+    typer.echo(f"\n=== RAGAS eval: config={config}, n={n} ===")
+    typer.echo(
+        f"Mean faithfulness:      {mean_faith:.3f}  (answered-only: {mean_faith_answered:.3f})"
+    )
+    typer.echo(f"Mean answer relevance:  {mean_rel:.3f}  (answered-only: {mean_rel_answered:.3f})")
+    typer.echo(f"Abstentions:            {n_abstained}/{n}")
+    typer.echo(f"\nPer-item: {per_path}")
+
+
 if __name__ == "__main__":
     app()
